@@ -1,0 +1,7 @@
+* Add tests to make sure proper errors are triggered when connecting to a server:
+ - without certificate.
+ - with an untrusted certificate.
+ - with a certificate that is no longer or not yet valid.
+ - with a certificate that is revoked (CRL).
+* Seed PRNG with robust entropy source.
+* Add autotools support.

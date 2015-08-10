@@ -2,38 +2,55 @@
 
 #include <openssl/ssl.h>
 
-#define MAX_TCP_PORT_STR_LENGTH                 5
-#define DEFAULT_HTTPS_PORT                      443
 #define ADDITIONAL_TRUSTED_CA_BUNDLE_PATH       "../certs/go_daddy_ca_bundle.pem"
 #define HTTP_BUFFER_SIZE                        1024
 
-void init_openssl(void)
+int init_openssl(void)
 {
   SSL_load_error_strings();
   SSL_library_init();
-  seed_prng(128);
+
+  if (seed_prng(128))
+    return -1;
+
+  return 0;
 }
 
 typedef struct cmd_line_options {
   char* server_host_name;
+  int secure;
 } cmd_line_options_t;
 
 void print_usage(void)
 {
   fprintf(stderr, "Usage:\n"\
-          "ssl-client host\n");
+          "ssl-client [-s] [--secure] host:port\n");
 }
 
 int parse_cmd_line_options(int argc, char* argv[], cmd_line_options_t* res)
 {
-  if (argc != 2)
+  int curr_argc = 1;
+
+  if (argc < 2)
   {
-    return 0;
+    return -1;
   }
 
-  res->server_host_name = strdup(argv[1]);
+  while (curr_argc < argc) {
+    if (!strncmp(argv[curr_argc], "-s", strlen("-s")) ||
+        !strncmp(argv[curr_argc], "--secure", strlen("--secure"))) {
+      res->secure = 1;
+    } else {
+      res->server_host_name = strdup(argv[curr_argc]);
+    }
 
-  return 1;
+    ++curr_argc;
+  }
+
+  if (res->server_host_name == NULL)
+    return -1;
+
+  return 0;
 }
 
 int ssl_verify_cert_callback(int ok, X509_STORE_CTX* store)
@@ -67,7 +84,8 @@ SSL_CTX* setup_ssl_client_ctx(void)
   ctx = SSL_CTX_new(SSLv23_method());
   if (SSL_CTX_load_verify_locations(ctx, ADDITIONAL_TRUSTED_CA_BUNDLE_PATH, NULL) != 1)
   {
-    fprintf(stderr, "Could not additional trusted certificates at %s\n", ADDITIONAL_TRUSTED_CA_BUNDLE_PATH);
+    fprintf(stderr, "Could not additional trusted certificates at %s\n",
+      ADDITIONAL_TRUSTED_CA_BUNDLE_PATH);
   }
 
   if (SSL_CTX_set_default_verify_paths(ctx) != 1)
@@ -84,75 +102,57 @@ SSL_CTX* setup_ssl_client_ctx(void)
 int seed_prng(int bytes)
 {
   if (!RAND_load_file("/dev/urandom", bytes))
-    return 0;
+    return -1;
 
-  return 1;
+  return 0;
 }
 
 int main(int argc, char* argv[])
 {
   cmd_line_options_t    cmd_line_options;
-  BIO*                  bio_conn = NULL;
-  SSL*                  ssl = NULL;
+  BIO*                  bio = NULL;
   SSL_CTX*              ssl_ctx = NULL;
   int                   ssl_connect_ret = 0;
   char                  head_http_req_buffer[HTTP_BUFFER_SIZE];
   char                  http_res_buffer[HTTP_BUFFER_SIZE];
   int                   nb_bytes_read = 0;
 
-  if (!parse_cmd_line_options(argc, argv, &cmd_line_options))
+  memset(&cmd_line_options, 0, sizeof(cmd_line_options));
+
+  if (parse_cmd_line_options(argc, argv, &cmd_line_options))
   {
     print_usage();
     return 1;
   }
 
-  init_openssl();
+  if (init_openssl()) {
+    fprintf(stderr, "Could not initialize OpenSSL, exiting.");
+    return 1;
+  }
+
   ssl_ctx = setup_ssl_client_ctx();
 
-  char port_str[MAX_TCP_PORT_STR_LENGTH];
-  snprintf(port_str, MAX_TCP_PORT_STR_LENGTH, "%d", DEFAULT_HTTPS_PORT);
-
-  // + 2 to account for the ":" and \0 characters
-  size_t host_and_port_str_length = strlen(cmd_line_options.server_host_name) + strlen(port_str) + 2;
-  char* host_and_port_str = malloc(host_and_port_str_length * sizeof(char));
-  if (!host_and_port_str)
-  {
-    fprintf(stderr, "Could not allocate memory for host and port string, aborting.");
-    return 1;
-  }
-  snprintf(host_and_port_str, host_and_port_str_length, "%s:%d", cmd_line_options.server_host_name, DEFAULT_HTTPS_PORT);
-
-  fprintf(stdout, "Connecting to: %s...\n", host_and_port_str);
-  bio_conn = BIO_new_connect(host_and_port_str);
-  if (!bio_conn)
-  {
-    fprintf(stderr, "Error creating connection BIO, aborting\n");
-    return 1;
+  if (!cmd_line_options.secure) {
+    printf("Creating plain connection...\n");
+    bio = BIO_new(BIO_s_connect());
+    if (!bio)
+    {
+      fprintf(stderr, "Error creating connection BIO, exiting\n");
+      return 1;
+    }
+  } else {
+    printf("Creating SSL connection...\n");
+    bio = BIO_new_ssl_connect(ssl_ctx);
   }
 
-  if (BIO_do_connect(bio_conn) <= 0)
-  {
-    fprintf(stderr, "Error connecting to remote host, aborting\n");
-    return 1;
-  }
+  BIO_set_conn_hostname(bio, cmd_line_options.server_host_name);
 
-  printf("Initializing SSL engine...\n");
-  ssl = SSL_new(ssl_ctx);
-  if (!ssl)
-  {
-    fprintf(stderr, "Error while creating SSL context, aborting");
-    return 1;
-  }
-
-  printf("Setting BIO for SSL engine...\n");
-  SSL_set_bio(ssl, bio_conn, bio_conn);
-
-  printf("Performing SSL handshake...\n");
-  if ((ssl_connect_ret = SSL_connect(ssl)) <= 0)
-  {
-    fprintf(stderr, "Error during SSL handshake, reason: %d, aborting", SSL_get_error(ssl, ssl_connect_ret));
-    return 1;
-  }
+  fprintf(stdout, "Connecting to: %s...\n", cmd_line_options.server_host_name);
+  if (BIO_do_connect(bio) <= 0)
+    {
+      fprintf(stderr, "Error connecting to remote host, exiting\n");
+      return 1;
+    }
 
   snprintf(head_http_req_buffer, HTTP_BUFFER_SIZE,
            "HEAD / HTTP/1.%s\r\nHost: %s\r\n"\
@@ -160,24 +160,22 @@ int main(int argc, char* argv[])
            "1", cmd_line_options.server_host_name);
   fprintf(stdout, "Request sent:\n%s", head_http_req_buffer);
 
-  if (SSL_write(ssl, head_http_req_buffer, strlen(head_http_req_buffer)) <= 0)
+  if (BIO_write(bio, head_http_req_buffer, strlen(head_http_req_buffer)) <= 0)
   {
-    fprintf(stderr, "Could not send HEAD request, aborting");
+    fprintf(stderr, "Could not send HEAD request, exiting\n");
     return 1;
   }
 
-  if ((nb_bytes_read = (SSL_read(ssl, http_res_buffer, HTTP_BUFFER_SIZE))) <= 0)
+  if ((nb_bytes_read = (BIO_read(bio, http_res_buffer, HTTP_BUFFER_SIZE))) <= 0)
   {
-    fprintf(stderr, "Could not read response to HEAD request, aborting");
+    fprintf(stderr, "Could not read response to HEAD request, exiting\n");
     return 1;
   }
 
   http_res_buffer[nb_bytes_read] = '\0';
   fprintf(stdout, "Response:\n%s", http_res_buffer);
 
-  printf("Shutting down SSL...\n");
-  SSL_shutdown(ssl);
-  SSL_free(ssl);
+  BIO_free_all(bio);
   SSL_CTX_free(ssl_ctx);
   printf("SSL shutdown completed.\n");
 
